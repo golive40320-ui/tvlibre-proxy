@@ -2,7 +2,7 @@ const http = require('http');
 const https = require('https');
 
 const PORT = process.env.PORT || 3000;
-const SELF_URL = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
+const SELF_URL = process.env.RENDER_EXTERNAL_URL || 'https://tvlibre-proxy.onrender.com';
 const ALLOWED_HOST = '38.226.49.253';
 
 const CORS = {
