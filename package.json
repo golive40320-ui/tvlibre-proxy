@@ -1,12 +1,15 @@
 {
   "name": "tvlibre-proxy",
-  "version": "1.0.0",
-  "description": "TvLibre Stream Proxy",
+  "version": "2.0.0",
+  "description": "TvLibre Stream Proxy with HEVC transcoding",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
+  "dependencies": {
+    "ffmpeg-static": "^5.2.0"
+  },
   "engines": {
-    "node": ">=16"
+    "node": ">=18"
   }
 }
