@@ -1,7 +1,6 @@
 const http = require('http');
 const https = require('https');
 const { spawn } = require('child_process');
-const path = require('path');
 
 const PORT = process.env.PORT || 3000;
 const SELF_URL = 'https://tvlibre-proxy.onrender.com';
@@ -14,19 +13,15 @@ const CORS = {
   'Access-Control-Expose-Headers': 'Content-Length, Content-Type',
 };
 
-// Try to find ffmpeg — native first, then ffmpeg-static package
 let FFMPEG_PATH = 'ffmpeg';
-try {
-  FFMPEG_PATH = require('ffmpeg-static');
-  console.log('Using ffmpeg-static:', FFMPEG_PATH);
-} catch(e) {
-  console.log('Using system ffmpeg');
-}
+try { FFMPEG_PATH = require('ffmpeg-static'); } catch(e) {}
 
-let ffmpegAvailable = false;
-const check = spawn(FFMPEG_PATH, ['-version']);
-check.on('close', c => { ffmpegAvailable = c === 0; console.log('ffmpeg ready:', ffmpegAvailable); });
-check.on('error', () => console.log('ffmpeg not found'));
+let ffmpegOk = false;
+try {
+  const c = spawn(FFMPEG_PATH, ['-version']);
+  c.on('close', code => { ffmpegOk = code === 0; console.log('ffmpeg:', ffmpegOk, FFMPEG_PATH); });
+  c.on('error', () => {});
+} catch(e) {}
 
 function rewriteM3u8(text, base) {
   return text.split('\n').map(line => {
@@ -37,11 +32,11 @@ function rewriteM3u8(text, base) {
   }).join('\n');
 }
 
-function fetchBuffer(targetUrl, cb) {
+function fetchBuffer(url, cb) {
   let u;
-  try { u = new URL(targetUrl); } catch(e) { return cb(new Error('URL inválida')); }
+  try { u = new URL(url); } catch(e) { return cb(new Error('bad url')); }
   const lib = u.protocol === 'https:' ? https : http;
-  const opts = {
+  const req = lib.request({
     hostname: u.hostname,
     port: parseInt(u.port) || (u.protocol === 'https:' ? 443 : 80),
     path: u.pathname + (u.search || ''),
@@ -51,46 +46,61 @@ function fetchBuffer(targetUrl, cb) {
       'Accept': '*/*', 'Accept-Encoding': 'identity', 'Connection': 'close',
     },
     timeout: 30000,
-  };
-  const req = lib.request(opts, upstream => {
+  }, up => {
     const chunks = [];
-    upstream.on('data', c => chunks.push(c));
-    upstream.on('end', () => cb(null, Buffer.concat(chunks), upstream.headers['content-type'] || '', upstream.statusCode));
-    upstream.on('error', cb);
+    up.on('data', c => chunks.push(c));
+    up.on('end', () => cb(null, Buffer.concat(chunks), up.headers['content-type']||'', up.statusCode));
+    up.on('error', cb);
   });
   req.on('timeout', () => { req.destroy(); cb(new Error('timeout')); });
   req.on('error', cb);
   req.end();
 }
 
-function transcodeToH264(inputBuf, res) {
-  console.log(`[TRANSCODE] ${inputBuf.length}b HEVC→H264`);
+function sendWithCors(res, status, contentType, body) {
+  // Always include CORS headers
+  const headers = { ...CORS, 'Content-Type': contentType, 'Cache-Control': 'no-cache' };
+  if (Buffer.isBuffer(body)) headers['Content-Length'] = String(body.length);
+  res.writeHead(status, headers);
+  res.end(body);
+}
+
+function transcodeAndSend(inputBuf, res) {
+  // Write CORS headers FIRST before piping
+  res.writeHead(200, {
+    ...CORS,
+    'Content-Type': 'video/MP2T',
+    'Cache-Control': 'no-cache',
+    'Transfer-Encoding': 'chunked',
+  });
+
   const ff = spawn(FFMPEG_PATH, [
     '-loglevel', 'error',
     '-i', 'pipe:0',
-    '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '30',
+    '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency', '-crf', '30',
     '-c:a', 'aac', '-b:a', '96k',
     '-f', 'mpegts', 'pipe:1'
   ]);
-  res.writeHead(200, { ...CORS, 'Content-Type': 'video/MP2T', 'Cache-Control': 'no-cache' });
-  ff.stdout.pipe(res);
+
+  ff.stdout.pipe(res, { end: true });
   ff.stdin.write(inputBuf);
   ff.stdin.end();
-  ff.on('error', e => { console.error('ffmpeg err:', e.message); });
+  ff.stderr.on('data', () => {});
+  ff.on('error', e => console.error('ffmpeg err:', e.message));
 }
 
-function handleRequest(targetUrl, req, res) {
+function handleProxy(targetUrl, req, res) {
   console.log(`→ ${targetUrl.substring(0, 80)}`);
   fetchBuffer(targetUrl, (err, body, ct, status) => {
     if (err) {
-      console.error('Err:', err.message);
-      if (!res.headersSent) { res.writeHead(502, CORS); res.end(err.message); }
+      console.error('fetch err:', err.message);
+      if (!res.headersSent) sendWithCors(res, 502, 'text/plain', err.message);
       return;
     }
     if (status >= 400) {
-      res.writeHead(status, { ...CORS, 'Content-Type': 'text/plain' });
-      res.end(`Upstream: ${status}`); return;
+      sendWithCors(res, status, 'text/plain', `Upstream: ${status}`); return;
     }
+
     console.log(`← ${status} | ${ct.substring(0,30)} | ${body.length}b`);
 
     const text = body.toString('utf8');
@@ -99,19 +109,19 @@ function handleRequest(targetUrl, req, res) {
 
     if (isM3u8) {
       const base = targetUrl.replace(/[^\/]*$/, '');
-      res.writeHead(200, { ...CORS, 'Content-Type': 'application/vnd.apple.mpegurl', 'Cache-Control': 'no-cache' });
-      res.end(rewriteM3u8(text, base));
+      sendWithCors(res, 200, 'application/vnd.apple.mpegurl', rewriteM3u8(text, base));
     } else {
-      // Detect HEVC by checking for H.264 start codes absence
-      const hasH264 = body.includes(Buffer.from([0x00,0x00,0x00,0x01,0x67])) ||
-                      body.includes(Buffer.from([0x00,0x00,0x01,0x67]));
-      const likelyHevc = !hasH264 && body.length > 5000 && targetUrl.includes('.ts');
+      // Check if HEVC (no H.264 SPS NAL unit found)
+      const hasH264sps = body.includes(Buffer.from([0,0,0,1,0x67])) ||
+                         body.includes(Buffer.from([0,0,1,0x67]));
+      const isTs = targetUrl.includes('.ts') || ct.includes('MP2T') || ct.includes('mpeg');
+      const needsTranscode = ffmpegOk && isTs && !hasH264sps && body.length > 10000;
 
-      if (ffmpegAvailable && likelyHevc) {
-        transcodeToH264(body, res);
+      if (needsTranscode) {
+        console.log(`[TRANSCODE] ${body.length}b`);
+        transcodeAndSend(body, res);
       } else {
-        res.writeHead(200, { ...CORS, 'Content-Type': ct||'video/MP2T', 'Content-Length': String(body.length), 'Cache-Control': 'no-cache' });
-        res.end(body);
+        sendWithCors(res, 200, ct || 'video/MP2T', body);
       }
     }
   });
@@ -119,23 +129,27 @@ function handleRequest(targetUrl, req, res) {
 
 const server = http.createServer((req, res) => {
   if (req.method === 'OPTIONS') { res.writeHead(204, CORS); res.end(); return; }
+
   let u;
-  try { u = new URL(req.url, `http://localhost:${PORT}`); }
-  catch(e) { res.writeHead(400); res.end('Bad'); return; }
+  try { u = new URL(req.url, `http://localhost`); }
+  catch(e) { res.writeHead(400); res.end('bad'); return; }
 
   if (u.pathname === '/' || u.pathname === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json', ...CORS });
-    res.end(JSON.stringify({ ok: true, ffmpeg: ffmpegAvailable, ffmpegPath: FFMPEG_PATH, uptime: process.uptime().toFixed(0)+'s' }));
+    res.end(JSON.stringify({ ok: true, ffmpeg: ffmpegOk, uptime: process.uptime().toFixed(0)+'s' }));
     return;
   }
+
   if (u.pathname === '/proxy') {
     const raw = u.searchParams.get('url');
-    if (!raw) { res.writeHead(400, CORS); res.end('Falta ?url='); return; }
+    if (!raw) { res.writeHead(400, CORS); res.end('falta url'); return; }
     const target = decodeURIComponent(raw);
-    if (!target.includes(ALLOWED_HOST)) { res.writeHead(403, CORS); res.end('No permitido'); return; }
-    handleRequest(target, req, res); return;
+    if (!target.includes(ALLOWED_HOST)) { res.writeHead(403, CORS); res.end('no permitido'); return; }
+    handleProxy(target, req, res);
+    return;
   }
-  res.writeHead(404, CORS); res.end('Not found');
+
+  res.writeHead(404, CORS); res.end('not found');
 });
 
-server.listen(PORT, '0.0.0.0', () => console.log(`TvLibre Proxy → ${SELF_URL} (port ${PORT})`));
+server.listen(PORT, '0.0.0.0', () => console.log(`TvLibre Proxy → ${SELF_URL} :${PORT}`));
