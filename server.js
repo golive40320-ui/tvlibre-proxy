@@ -12,6 +12,36 @@ const CORS = {
   'Access-Control-Expose-Headers': 'Content-Length, Content-Type',
 };
 
+function filterHevc(text, base) {
+  // Remove HEVC/H.265 levels from master playlist, keep only H.264
+  const lines = text.split('\n');
+  const filtered = [];
+  let skip = false;
+  for (let i = 0; i < lines.length; i++) {
+    const l = lines[i];
+    if (l.includes('#EXT-X-STREAM-INF')) {
+      // Check if HEVC (CODECS contains hvc1 or hev1)
+      const isHevc = /CODECS="[^"]*hvc1|hev1/i.test(l);
+      if (isHevc) { skip = true; continue; }
+      skip = false;
+    }
+    if (skip && !l.startsWith('#')) { skip = false; continue; }
+    filtered.push(l);
+  }
+  // If we filtered everything, return original
+  const hasStreams = filtered.some(l => !l.startsWith('#') && l.trim());
+  return hasStreams ? filtered.join('\n') : text;
+}
+
+function rewriteM3u8(text, base) {
+  return text.split('\n').map(line => {
+    const t = line.trim();
+    if (!t || t.startsWith('#')) return line;
+    const abs = t.startsWith('http') ? t : base + t;
+    return `${SELF_URL}/proxy?url=${encodeURIComponent(abs)}`;
+  }).join('\n');
+}
+
 function proxyRequest(targetUrl, req, res) {
   let u;
   try { u = new URL(targetUrl); }
@@ -51,7 +81,6 @@ function proxyRequest(targetUrl, req, res) {
       const body = Buffer.concat(chunks);
       const text = body.toString('utf8');
 
-      // Detect M3U8 by content-type OR content OR URL
       const isM3u8 = ct.includes('mpegurl')
         || targetUrl.includes('.m3u8')
         || text.startsWith('#EXTM3U')
@@ -62,16 +91,11 @@ function proxyRequest(targetUrl, req, res) {
 
       if (isM3u8) {
         const base = targetUrl.replace(/[^\/]*$/, '');
-        const lines = text.split('\n');
-        const rewritten = lines.map(line => {
-          const t = line.trim();
-          if (!t || t.startsWith('#')) return line;
-          // It's a URL line — make absolute and proxy it
-          const abs = t.startsWith('http') ? t : base + t;
-          return `${SELF_URL}/proxy?url=${encodeURIComponent(abs)}`;
-        }).join('\n');
+        // Filter HEVC from master playlist
+        const filtered = text.includes('#EXT-X-STREAM-INF') ? filterHevc(text, base) : text;
+        const rewritten = rewriteM3u8(filtered, base);
+        console.log(`[M3U8] ${text.split('\n').length} lines → ${rewritten.split('\n').length} lines`);
 
-        console.log(`[M3U8] ${lines.length} lines, base=${base.substring(0,50)}`);
         res.writeHead(200, {
           ...CORS,
           'Content-Type': 'application/vnd.apple.mpegurl',
@@ -79,7 +103,6 @@ function proxyRequest(targetUrl, req, res) {
         });
         res.end(rewritten);
       } else {
-        // Binary (.ts segment or other)
         console.log(`[BIN] ${body.length} bytes`);
         res.writeHead(200, {
           ...CORS,
@@ -92,22 +115,21 @@ function proxyRequest(targetUrl, req, res) {
     });
 
     upstream.on('error', e => {
-      console.error('Upstream stream error:', e.message);
+      console.error('Stream error:', e.message);
       if (!res.headersSent) { res.writeHead(502, CORS); res.end(e.message); }
     });
   });
 
   proxyReq.on('timeout', () => {
     proxyReq.destroy();
-    console.warn('Timeout:', targetUrl.substring(0,60));
-    if (!res.headersSent) { res.writeHead(504, CORS); res.end('Gateway timeout'); }
+    if (!res.headersSent) { res.writeHead(504, CORS); res.end('Timeout'); }
   });
 
   proxyReq.on('error', e => {
-    console.error(`[${e.code}] ${e.message} | ${targetUrl.substring(0,60)}`);
+    console.error(`[${e.code}] ${e.message}`);
     if (!res.headersSent) {
       res.writeHead(502, { ...CORS, 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: e.code, msg: e.message, url: targetUrl.substring(0,80) }));
+      res.end(JSON.stringify({ error: e.code, msg: e.message }));
     }
   });
 
@@ -115,9 +137,7 @@ function proxyRequest(targetUrl, req, res) {
 }
 
 const server = http.createServer((req, res) => {
-  if (req.method === 'OPTIONS') {
-    res.writeHead(204, CORS); res.end(); return;
-  }
+  if (req.method === 'OPTIONS') { res.writeHead(204, CORS); res.end(); return; }
 
   let u;
   try { u = new URL(req.url, `http://localhost:${PORT}`); }
@@ -133,9 +153,7 @@ const server = http.createServer((req, res) => {
     const raw = u.searchParams.get('url');
     if (!raw) { res.writeHead(400, CORS); res.end('Falta ?url='); return; }
     const target = decodeURIComponent(raw);
-    if (!target.includes(ALLOWED_HOST)) {
-      res.writeHead(403, CORS); res.end('Host no permitido'); return;
-    }
+    if (!target.includes(ALLOWED_HOST)) { res.writeHead(403, CORS); res.end('Host no permitido'); return; }
     proxyRequest(target, req, res);
     return;
   }
@@ -143,6 +161,4 @@ const server = http.createServer((req, res) => {
   res.writeHead(404, CORS); res.end('Not found');
 });
 
-server.listen(PORT, '0.0.0.0', () => {
-  console.log(`TvLibre Proxy corriendo → ${SELF_URL} (port ${PORT})`);
-});
+server.listen(PORT, '0.0.0.0', () => console.log(`TvLibre Proxy → ${SELF_URL} (port ${PORT})`));
