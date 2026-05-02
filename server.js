@@ -1,6 +1,5 @@
 const http = require('http');
 const https = require('https');
-const { spawn } = require('child_process');
 
 const PORT = process.env.PORT || 3000;
 const SELF_URL = 'https://tvlibre-proxy.onrender.com';
@@ -13,16 +12,6 @@ const CORS = {
   'Access-Control-Expose-Headers': 'Content-Length, Content-Type',
 };
 
-let FFMPEG_PATH = 'ffmpeg';
-try { FFMPEG_PATH = require('ffmpeg-static'); } catch(e) {}
-
-let ffmpegOk = false;
-try {
-  const c = spawn(FFMPEG_PATH, ['-version']);
-  c.on('close', code => { ffmpegOk = code === 0; console.log('ffmpeg:', ffmpegOk, FFMPEG_PATH); });
-  c.on('error', () => {});
-} catch(e) {}
-
 function rewriteM3u8(text, base) {
   return text.split('\n').map(line => {
     const t = line.trim();
@@ -30,6 +19,28 @@ function rewriteM3u8(text, base) {
     const abs = t.startsWith('http') ? t : base + t;
     return `${SELF_URL}/proxy?url=${encodeURIComponent(abs)}`;
   }).join('\n');
+}
+
+// Filter master playlist: keep only H.264 streams, remove HEVC
+function filterMaster(text, base) {
+  const lines = text.split('\n');
+  const out = [];
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (line.includes('#EXT-X-STREAM-INF')) {
+      const next = lines[i + 1] ? lines[i + 1].trim() : '';
+      // Check codec - skip HEVC (hvc1, hev1, dvh1)
+      const isHevc = /CODECS="[^"]*(?:hvc1|hev1|dvh1)/i.test(line);
+      if (isHevc) {
+        i++; // skip URL line too
+        continue;
+      }
+    }
+    out.push(line);
+  }
+  // Verify we still have streams
+  const hasUrl = out.some(l => l.trim() && !l.startsWith('#'));
+  return hasUrl ? out.join('\n') : text; // fallback to original if all filtered
 }
 
 function fetchBuffer(url, cb) {
@@ -57,51 +68,16 @@ function fetchBuffer(url, cb) {
   req.end();
 }
 
-function sendWithCors(res, status, contentType, body) {
-  // Always include CORS headers
-  const headers = { ...CORS, 'Content-Type': contentType, 'Cache-Control': 'no-cache' };
-  if (Buffer.isBuffer(body)) headers['Content-Length'] = String(body.length);
-  res.writeHead(status, headers);
+function send(res, status, ct, body) {
+  res.writeHead(status, { ...CORS, 'Content-Type': ct, 'Cache-Control': 'no-cache', 'Content-Length': String(Buffer.isBuffer(body)?body.length:Buffer.byteLength(body)) });
   res.end(body);
-}
-
-function transcodeAndSend(inputBuf, res) {
-  // Write CORS headers FIRST before piping
-  res.writeHead(200, {
-    ...CORS,
-    'Content-Type': 'video/MP2T',
-    'Cache-Control': 'no-cache',
-    'Transfer-Encoding': 'chunked',
-  });
-
-  const ff = spawn(FFMPEG_PATH, [
-    '-loglevel', 'error',
-    '-i', 'pipe:0',
-    '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency', '-crf', '30',
-    '-c:a', 'aac', '-b:a', '96k',
-    '-f', 'mpegts', 'pipe:1'
-  ]);
-
-  ff.stdout.pipe(res, { end: true });
-  ff.stdin.write(inputBuf);
-  ff.stdin.end();
-  ff.stderr.on('data', () => {});
-  ff.on('error', e => console.error('ffmpeg err:', e.message));
 }
 
 function handleProxy(targetUrl, req, res) {
   console.log(`→ ${targetUrl.substring(0, 80)}`);
   fetchBuffer(targetUrl, (err, body, ct, status) => {
-    if (err) {
-      console.error('fetch err:', err.message);
-      if (!res.headersSent) sendWithCors(res, 502, 'text/plain', err.message);
-      return;
-    }
-    if (status >= 400) {
-      sendWithCors(res, status, 'text/plain', `Upstream: ${status}`); return;
-    }
-
-    console.log(`← ${status} | ${ct.substring(0,30)} | ${body.length}b`);
+    if (err) { console.error(err.message); if(!res.headersSent){res.writeHead(502,CORS);res.end(err.message);} return; }
+    if (status >= 400) { send(res, status, 'text/plain', `Upstream: ${status}`); return; }
 
     const text = body.toString('utf8');
     const isM3u8 = ct.includes('mpegurl') || targetUrl.includes('.m3u8') ||
@@ -109,34 +85,29 @@ function handleProxy(targetUrl, req, res) {
 
     if (isM3u8) {
       const base = targetUrl.replace(/[^\/]*$/, '');
-      sendWithCors(res, 200, 'application/vnd.apple.mpegurl', rewriteM3u8(text, base));
-    } else {
-      // Check if HEVC (no H.264 SPS NAL unit found)
-      const hasH264sps = body.includes(Buffer.from([0,0,0,1,0x67])) ||
-                         body.includes(Buffer.from([0,0,1,0x67]));
-      const isTs = targetUrl.includes('.ts') || ct.includes('MP2T') || ct.includes('mpeg');
-      const needsTranscode = ffmpegOk && isTs && !hasH264sps && body.length > 10000;
-
-      if (needsTranscode) {
-        console.log(`[TRANSCODE] ${body.length}b`);
-        transcodeAndSend(body, res);
-      } else {
-        sendWithCors(res, 200, ct || 'video/MP2T', body);
+      let processed = text;
+      // If master playlist, filter out HEVC
+      if (text.includes('#EXT-X-STREAM-INF')) {
+        processed = filterMaster(text, base);
+        const streamCount = processed.split('\n').filter(l=>l.trim()&&!l.startsWith('#')).length;
+        console.log(`[MASTER] streams after HEVC filter: ${streamCount}`);
       }
+      send(res, 200, 'application/vnd.apple.mpegurl', rewriteM3u8(processed, base));
+    } else {
+      console.log(`[TS] ${body.length}b ${ct}`);
+      send(res, 200, ct||'video/MP2T', body);
     }
   });
 }
 
 const server = http.createServer((req, res) => {
   if (req.method === 'OPTIONS') { res.writeHead(204, CORS); res.end(); return; }
-
   let u;
-  try { u = new URL(req.url, `http://localhost`); }
-  catch(e) { res.writeHead(400); res.end('bad'); return; }
+  try { u = new URL(req.url, `http://localhost`); } catch(e) { res.writeHead(400); res.end('bad'); return; }
 
   if (u.pathname === '/' || u.pathname === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json', ...CORS });
-    res.end(JSON.stringify({ ok: true, ffmpeg: ffmpegOk, uptime: process.uptime().toFixed(0)+'s' }));
+    res.end(JSON.stringify({ ok: true, uptime: process.uptime().toFixed(0)+'s' }));
     return;
   }
 
@@ -145,8 +116,7 @@ const server = http.createServer((req, res) => {
     if (!raw) { res.writeHead(400, CORS); res.end('falta url'); return; }
     const target = decodeURIComponent(raw);
     if (!target.includes(ALLOWED_HOST)) { res.writeHead(403, CORS); res.end('no permitido'); return; }
-    handleProxy(target, req, res);
-    return;
+    handleProxy(target, req, res); return;
   }
 
   res.writeHead(404, CORS); res.end('not found');
